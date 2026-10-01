@@ -16,6 +16,7 @@ use deno_error::JsErrorBox;
 
 use crate::import_map::ImportMap;
 use crate::ops::ObscuraState;
+use obscura_net::RequestOptions;
 
 /// Observable network activity for ES-module graphs.
 ///
@@ -237,7 +238,15 @@ impl ModuleLoader for ObscuraModuleLoader {
                 let stealth = state.stealth_client.clone();
                 #[cfg(not(feature = "stealth"))]
                 let stealth: Option<std::sync::Arc<()>> = None;
-                Ok((client, stealth, state.callbacks.clone()))
+                Ok((
+                    client,
+                    stealth,
+                    state.callbacks.clone(),
+                    state.intercept_enabled,
+                    state.request_interceptor.clone(),
+                    state.accept_language_override.clone(),
+                    state.user_agent_override.clone(),
+                ))
             })(),
             None => self
                 .standalone_client
@@ -247,7 +256,7 @@ impl ModuleLoader for ObscuraModuleLoader {
                     let stealth = None;
                     #[cfg(not(feature = "stealth"))]
                     let stealth: Option<std::sync::Arc<()>> = None;
-                    (client, stealth, None)
+                    (client, stealth, None, false, None, None, None)
                 })
                 .ok_or_else(|| "No network context wired to module loader".to_string()),
         };
@@ -264,26 +273,35 @@ impl ModuleLoader for ObscuraModuleLoader {
             );
 
             match page_network {
-                Ok((client, stealth, callbacks)) => {
+                Ok((client, stealth, callbacks, intercept_enabled, interceptor, accept_language, user_agent)) => {
+                    if intercept_enabled && interceptor.is_none() {
+                        return Err(io_err("Module request interception unavailable".into()));
+                    }
                     let requested = ModuleSpecifier::parse(&url)
                         .map_err(|e| io_err(format!("Invalid module URL {}: {}", url, e)))?;
                     let request =
                         obscura_net::ResourceRequest::module_script(&document_url, &referrer);
                     #[cfg(feature = "stealth")]
                     let resp = match stealth {
-                        Some(stealth) => stealth
+                        Some(stealth) if interceptor.is_none() => stealth
                             .fetch_resource_with_callbacks(
                                 &requested,
                                 request,
                                 callbacks.as_deref(),
                             )
                             .await,
+                        Some(_) => return Err(io_err("Stealth module interception unavailable".into())),
                         None => {
                             client
-                                .fetch_resource_with_callbacks(
+                                .fetch_resource_with_callbacks_options(
                                     &requested,
                                     request,
                                     callbacks.as_deref(),
+                                    RequestOptions {
+                                        interceptor: interceptor.as_deref(),
+                                        accept_language: accept_language.as_deref(),
+                                        user_agent: user_agent.as_deref(),
+                                    },
                                 )
                                 .await
                         }
@@ -293,10 +311,15 @@ impl ModuleLoader for ObscuraModuleLoader {
                     let resp = {
                         let _ = &stealth;
                         client
-                            .fetch_resource_with_callbacks(
+                            .fetch_resource_with_callbacks_options(
                                 &requested,
                                 request,
                                 callbacks.as_deref(),
+                                RequestOptions {
+                                    interceptor: interceptor.as_deref(),
+                                    accept_language: accept_language.as_deref(),
+                                    user_agent: user_agent.as_deref(),
+                                },
                             )
                             .await
                             .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?

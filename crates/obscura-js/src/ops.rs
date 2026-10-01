@@ -17,6 +17,7 @@ use obscura_net::{
     CallbackRegistry, CookieJar, ObscuraHttpClient, RequestInfo, ResourceType, Response,
     SameSiteContext, same_site,
 };
+use obscura_net::interceptor::RequestInterceptor;
 #[cfg(feature = "render")]
 use obscura_net::{RequestCredentials, RequestMode, ResourceRequest};
 use tokio::sync::Mutex;
@@ -59,6 +60,7 @@ pub enum InterceptResolution {
 }
 
 pub struct InterceptedRequest {
+    pub page_id: Option<String>,
     pub request_id: String,
     pub url: String,
     pub method: String,
@@ -108,6 +110,7 @@ pub(crate) struct CanvasBackingSurface {
 pub struct ObscuraState {
     pub dom: Option<DomTree>,
     pub url: String,
+    pub page_id: Option<String>,
     /// WHATWG canonical name of the document's character encoding (e.g.
     /// "UTF-8", "EUC-JP"). Backs `document.characterSet` and the URL query
     /// encoding override for `<a>`/`<area>` hrefs in legacy-charset documents.
@@ -120,6 +123,9 @@ pub struct ObscuraState {
     pub blocked_urls: Vec<String>,
     pub cookie_jar: Option<Arc<CookieJar>>,
     pub http_client: Option<Arc<ObscuraHttpClient>>,
+    pub request_interceptor: Option<Arc<dyn RequestInterceptor + Send + Sync>>,
+    pub accept_language_override: Option<String>,
+    pub user_agent_override: Option<String>,
     /// The owning page's passive on_request/on_response callbacks (issue
     /// #408). Page-scoped, so scripted fetch()/XHR observation stays local to
     /// the page that registered it.
@@ -346,12 +352,16 @@ impl ObscuraState {
         ObscuraState {
             dom: None,
             url: "about:blank".to_string(),
+            page_id: None,
             encoding: "UTF-8".to_string(),
             title: String::new(),
             referrer: String::new(),
             blocked_urls: Vec::new(),
             cookie_jar: None,
             http_client: None,
+            request_interceptor: None,
+            accept_language_override: None,
+            user_agent_override: None,
             callbacks: None,
             #[cfg(feature = "stealth")]
             stealth_client: None,
@@ -2959,7 +2969,7 @@ async fn op_fetch_url(
         url
     );
 
-    let (cookie_jar, in_flight, page_in_flight, intercept_tx, proxy_url, callbacks, http_client) = {
+    let (cookie_jar, in_flight, page_in_flight, intercept_tx, intercept_enabled, proxy_url, callbacks, http_client, accept_language, user_agent) = {
         let state_borrow = state.borrow();
         let gs = state_borrow.borrow::<SharedState>().clone();
         let mut gs = gs.borrow_mut();
@@ -2997,7 +3007,11 @@ async fn op_fetch_url(
             gs.intercept_counter += 1;
             gs.intercept_tx
                 .clone()
-                .map(|tx| (tx, format!("intercept-{}", gs.intercept_counter)))
+                .map(|tx| (
+                    tx,
+                    format!("{}-intercept-{}", gs.page_id.as_deref().unwrap_or("page"), gs.intercept_counter),
+                    gs.page_id.clone(),
+                ))
         } else {
             None
         };
@@ -3006,9 +3020,12 @@ async fn op_fetch_url(
             in_flight,
             Arc::clone(&gs.page_in_flight),
             itx,
+            gs.intercept_enabled,
             proxy_url,
             gs.callbacks.clone(),
             gs.http_client.clone(),
+            gs.accept_language_override.clone(),
+            gs.user_agent_override.clone(),
         )
     };
     // The private-network opt-in is a BrowserContext policy, not only a
@@ -3048,11 +3065,19 @@ async fn op_fetch_url(
     let mut override_headers: Option<HashMap<String, String>> = None;
     let mut override_body: Option<Vec<u8>> = None;
 
-    if let Some((tx, request_id)) = intercept_tx {
+    if intercept_enabled && intercept_tx.is_none() {
+        return Ok(serde_json::json!({
+            "status": 0, "body": "", "url": url, "headers": {},
+            "blocked": true, "error": "Interception channel unavailable",
+        }).to_string());
+    }
+
+    if let Some((tx, request_id, page_id)) = &intercept_tx {
         let custom_headers: HashMap<String, String> =
             serde_json::from_str(&headers_json).unwrap_or_default();
         let (resolve_tx, resolve_rx) = tokio::sync::oneshot::channel();
         let intercepted = InterceptedRequest {
+            page_id: page_id.clone(),
             request_id: request_id.clone(),
             url: url.clone(),
             method: method.clone(),
@@ -3060,8 +3085,13 @@ async fn op_fetch_url(
             resource_type: "Fetch".to_string(),
             resolver: resolve_tx,
         };
-        if tx.send(intercepted).is_ok() {
-            match resolve_rx.await {
+        if tx.send(intercepted).is_err() {
+            return Ok(serde_json::json!({
+                "status": 0, "body": "", "url": url, "headers": {},
+                "blocked": true, "error": "Interception channel unavailable",
+            }).to_string());
+        }
+        match resolve_rx.await {
                 Ok(InterceptResolution::Fulfill {
                     status,
                     headers: h,
@@ -3110,8 +3140,10 @@ async fn op_fetch_url(
                         override_body.is_some()
                     );
                 }
-                Err(_) => {}
-            }
+                Err(_) => return Ok(serde_json::json!({
+                    "status": 0, "body": "", "url": url, "headers": {},
+                    "blocked": true, "error": "Interception decision unavailable",
+                }).to_string()),
         }
     }
 
@@ -3306,6 +3338,66 @@ async fn op_fetch_url(
     let mut crossed_origin = is_cross_origin;
     let cookie_initiator = url::Url::parse(&page_origin).ok();
     let response = loop {
+        // The initial request was paused above. Every redirect is a new
+        // request and must be approved before a socket is opened for it.
+        if redirects_followed > 0 {
+            if let Some((tx, request_id, page_id)) = &intercept_tx {
+                let (resolver, resolved) = tokio::sync::oneshot::channel();
+                if tx.send(InterceptedRequest {
+                    page_id: page_id.clone(),
+                    request_id: format!("{request_id}-redirect-{redirects_followed}"),
+                    url: current_url.clone(),
+                    method: current_method.to_string(),
+                    headers: current_headers.clone(),
+                    resource_type: "Fetch".into(),
+                    resolver,
+                }).is_err() {
+                    return Ok(serde_json::json!({
+                        "status": 0, "body": "", "url": current_url, "headers": {},
+                        "blocked": true, "error": "Interception channel unavailable",
+                    }).to_string());
+                }
+                match resolved.await {
+                    Ok(InterceptResolution::Continue { url, method, headers, body }) => {
+                        if let Some(url) = url {
+                            let parsed = url::Url::parse(&url).map_err(|_| {
+                                deno_error::JsErrorBox::generic("Invalid intercepted redirect URL")
+                            })?;
+                            if let Err(reason) = validate_fetch_url(&parsed, allow_private_network) {
+                                return Ok(serde_json::json!({
+                                    "status": 0, "body": "", "url": url, "headers": {},
+                                    "blocked": true, "error": reason,
+                                }).to_string());
+                            }
+                            current_url = url;
+                        }
+                        if let Some(method) = method {
+                            current_method = method.parse().map_err(|_| {
+                                deno_error::JsErrorBox::generic("Invalid intercepted redirect method")
+                            })?;
+                        }
+                        if let Some(headers) = headers { current_headers = headers; }
+                        if let Some(body) = body { current_body = body.into_bytes(); }
+                    }
+                    Ok(InterceptResolution::Fulfill { status, headers, body, body_base64 }) => {
+                        return Ok(intercept_fulfill_response(
+                            status, headers, &body, &body_base64, &current_url,
+                            &page_origin, &mode, credentials, internal_load,
+                        ).to_string());
+                    }
+                    Ok(InterceptResolution::Fail { reason }) => {
+                        return Ok(serde_json::json!({
+                            "status": 0, "body": "", "url": current_url, "headers": {},
+                            "blocked": true, "error": reason,
+                        }).to_string());
+                    }
+                    Err(_) => return Ok(serde_json::json!({
+                        "status": 0, "body": "", "url": current_url, "headers": {},
+                        "blocked": true, "error": "Interception decision unavailable",
+                    }).to_string()),
+                }
+            }
+        }
         let mut req = client
             .request(current_method.clone(), &current_url)
             .timeout(fetch_timeout());
@@ -3347,8 +3439,16 @@ async fn op_fetch_url(
         {
             req = req.header(
                 "User-Agent",
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+                user_agent.as_deref().unwrap_or("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"),
             );
+        }
+        if !current_headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("accept-language"))
+        {
+            if let Some(language) = &accept_language {
+                req = req.header("Accept-Language", language.as_str());
+            }
         }
 
         for (k, v) in &current_headers {
@@ -6777,6 +6877,10 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
         request_profile,
         resource_request,
         http_client,
+        request_interceptor,
+        accept_language,
+        user_agent,
+        intercept_enabled,
         callbacks,
         page_in_flight,
         blocked,
@@ -6824,6 +6928,10 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
             profile,
             request,
             gs.http_client.clone(),
+            gs.request_interceptor.clone(),
+            gs.accept_language_override.clone(),
+            gs.user_agent_override.clone(),
+            gs.intercept_enabled,
             gs.callbacks.clone(),
             Arc::clone(&gs.page_in_flight),
             blocked,
@@ -6875,29 +6983,39 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
     let _page_in_flight = PageImageInFlightGuard(page_in_flight);
 
     let parsed_url = url::Url::parse(&selected_url).ok();
-    let response = if blocked || parsed_url.is_none() {
+    let response = if blocked || parsed_url.is_none()
+        || (intercept_enabled && request_interceptor.is_none()) {
         None
     } else {
         let parsed_url = parsed_url.as_ref().unwrap();
         #[cfg(feature = "stealth")]
         {
             if let Some(client) = stealth_client {
-                client
-                    .fetch_resource_with_callbacks(
-                        parsed_url,
-                        resource_request.clone(),
-                        callbacks.as_deref(),
-                    )
-                    .await
-                    .ok()
+                if request_interceptor.is_some() {
+                    None
+                } else {
+                    client
+                        .fetch_resource_with_callbacks(
+                            parsed_url,
+                            resource_request.clone(),
+                            callbacks.as_deref(),
+                        )
+                        .await
+                        .ok()
+                }
             } else {
                 http_client
                     .as_ref()
                     .unwrap()
-                    .fetch_resource_with_callbacks(
+                    .fetch_resource_with_callbacks_options(
                         parsed_url,
                         resource_request,
                         callbacks.as_deref(),
+                        obscura_net::RequestOptions {
+                            interceptor: request_interceptor.as_deref(),
+                            accept_language: accept_language.as_deref(),
+                            user_agent: user_agent.as_deref(),
+                        },
                     )
                     .await
                     .ok()
@@ -6908,7 +7026,14 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
             http_client
                 .as_ref()
                 .unwrap()
-                .fetch_resource_with_callbacks(parsed_url, resource_request, callbacks.as_deref())
+                .fetch_resource_with_callbacks_options(
+                    parsed_url, resource_request, callbacks.as_deref(),
+                    obscura_net::RequestOptions {
+                        interceptor: request_interceptor.as_deref(),
+                        accept_language: accept_language.as_deref(),
+                        user_agent: user_agent.as_deref(),
+                    },
+                )
                 .await
                 .ok()
         }

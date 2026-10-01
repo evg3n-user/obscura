@@ -146,6 +146,15 @@ pub struct RequestInfo {
     pub resource_type: ResourceType,
 }
 
+/// Overrides owned by one page/request, rather than by the browser context's
+/// shared HTTP client. The interceptor is called before every redirect hop.
+#[derive(Default, Clone, Copy)]
+pub struct RequestOptions<'a> {
+    pub interceptor: Option<&'a (dyn RequestInterceptor + Send + Sync)>,
+    pub accept_language: Option<&'a str>,
+    pub user_agent: Option<&'a str>,
+}
+
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub enum ResourceType {
     Document,
@@ -967,6 +976,7 @@ struct ResourceCacheKey {
     initiator: Option<String>,
     referrer: Option<String>,
     user_agent: String,
+    accept_language: String,
     extra_headers: Vec<(String, String)>,
     max_response_bytes: usize,
 }
@@ -1227,6 +1237,15 @@ impl ObscuraHttpClient {
         self.fetch_with_method(Method::GET, url, None, callbacks).await
     }
 
+    pub async fn fetch_with_callbacks_options(
+        &self,
+        url: &Url,
+        callbacks: Option<&CallbackRegistry>,
+        options: RequestOptions<'_>,
+    ) -> Result<Response, ObscuraNetError> {
+        self.fetch_with_method_options(Method::GET, url, None, callbacks, options).await
+    }
+
     pub async fn post_form(&self, url: &Url, body: &str) -> Result<Response, ObscuraNetError> {
         self.fetch_with_method(Method::POST, url, Some(body.as_bytes().to_vec()), None).await
     }
@@ -1242,6 +1261,18 @@ impl ObscuraHttpClient {
             .await
     }
 
+    pub async fn post_form_with_callbacks_options(
+        &self,
+        url: &Url,
+        body: &str,
+        callbacks: Option<&CallbackRegistry>,
+        options: RequestOptions<'_>,
+    ) -> Result<Response, ObscuraNetError> {
+        self.fetch_with_method_options(
+            Method::POST, url, Some(body.as_bytes().to_vec()), callbacks, options,
+        ).await
+    }
+
     pub async fn fetch_with_method(
         &self,
         initial_method: Method,
@@ -1249,12 +1280,26 @@ impl ObscuraHttpClient {
         initial_body: Option<Vec<u8>>,
         callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
+        self.fetch_with_method_options(
+            initial_method, url, initial_body, callbacks, RequestOptions::default(),
+        ).await
+    }
+
+    pub async fn fetch_with_method_options(
+        &self,
+        initial_method: Method,
+        url: &Url,
+        initial_body: Option<Vec<u8>>,
+        callbacks: Option<&CallbackRegistry>,
+        options: RequestOptions<'_>,
+    ) -> Result<Response, ObscuraNetError> {
         self.fetch_with_profile(
             initial_method,
             url,
             initial_body,
             callbacks,
             ResourceRequest::navigation(),
+            options,
         )
         .await
     }
@@ -1269,7 +1314,19 @@ impl ObscuraHttpClient {
         request: ResourceRequest,
         callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
-        self.fetch_with_profile(Method::GET, url, None, callbacks, request)
+        self.fetch_resource_with_callbacks_options(
+            url, request, callbacks, RequestOptions::default(),
+        ).await
+    }
+
+    pub async fn fetch_resource_with_callbacks_options(
+        &self,
+        url: &Url,
+        request: ResourceRequest,
+        callbacks: Option<&CallbackRegistry>,
+        options: RequestOptions<'_>,
+    ) -> Result<Response, ObscuraNetError> {
+        self.fetch_with_profile(Method::GET, url, None, callbacks, request, options)
             .await
     }
 
@@ -1279,12 +1336,14 @@ impl ObscuraHttpClient {
         url: &Url,
         body: &Option<Vec<u8>>,
         request: &ResourceRequest,
+        options: RequestOptions<'_>,
     ) -> Option<ResourceCacheKey> {
         if *method != Method::GET
             || body.is_some()
             || request.resource_type == ResourceType::Document
             || !matches!(url.scheme(), "http" | "https")
             || self.interceptor.read().await.is_some()
+            || options.interceptor.is_some()
         {
             return None;
         }
@@ -1320,7 +1379,14 @@ impl ObscuraHttpClient {
             credentials: request.credentials,
             initiator: request.initiator.as_ref().map(ToString::to_string),
             referrer: request.referrer.as_ref().map(ToString::to_string),
-            user_agent: self.user_agent.read().await.clone(),
+            user_agent: match options.user_agent {
+                Some(value) => value.to_string(),
+                None => self.user_agent.read().await.clone(),
+            },
+            accept_language: match options.accept_language {
+                Some(value) => value.to_string(),
+                None => self.accept_language.read().await.clone(),
+            },
             extra_headers,
             max_response_bytes: request.max_response_bytes,
         })
@@ -1333,13 +1399,14 @@ impl ObscuraHttpClient {
         initial_body: Option<Vec<u8>>,
         callbacks: Option<&CallbackRegistry>,
         request: ResourceRequest,
+        options: RequestOptions<'_>,
     ) -> Result<Response, ObscuraNetError> {
         let Some(cache_key) = self
-            .resource_cache_key(&initial_method, url, &initial_body, &request)
+            .resource_cache_key(&initial_method, url, &initial_body, &request, options)
             .await
         else {
             return self
-                .fetch_with_profile_uncached(initial_method, url, initial_body, callbacks, request)
+                .fetch_with_profile_uncached(initial_method, url, initial_body, callbacks, request, options)
                 .await;
         };
 
@@ -1391,6 +1458,7 @@ impl ObscuraHttpClient {
                                 initial_body,
                                 callbacks,
                                 request,
+                                options,
                             )
                             .await
                         }
@@ -1404,6 +1472,7 @@ impl ObscuraHttpClient {
                             initial_body,
                             callbacks,
                             request,
+                            options,
                         )
                         .await;
                 }
@@ -1425,6 +1494,7 @@ impl ObscuraHttpClient {
                         initial_body,
                         callbacks,
                         request,
+                        options,
                     )
                     .await;
                 let shared_outcome = match &result {
@@ -1477,6 +1547,7 @@ impl ObscuraHttpClient {
         initial_body: Option<Vec<u8>>,
         callbacks: Option<&CallbackRegistry>,
         request: ResourceRequest,
+        options: RequestOptions<'_>,
     ) -> Result<Response, ObscuraNetError> {
         validate_url(url, self.allow_private_network)?;
         validate_request_mode(&request, url)?;
@@ -1515,25 +1586,67 @@ impl ObscuraHttpClient {
 
         for _redirect_count in 0..=max_redirects {
             validate_request_mode(&request, &current_url)?;
-            let request_info = RequestInfo {
+            let mut request_headers = self.extra_headers.read().await.clone();
+            if let Some(value) = options.accept_language {
+                request_headers.insert("accept-language".into(), value.to_string());
+            }
+            if let Some(value) = options.user_agent {
+                request_headers.insert("user-agent".into(), value.to_string());
+            }
+            let mut request_info = RequestInfo {
                 url: current_url.clone(),
                 method: method.to_string(),
-                headers: self.extra_headers.read().await.clone(),
+                headers: request_headers,
                 resource_type: request.resource_type.clone(),
             };
 
+            let mut hop_headers = HashMap::new();
             if let Some(interceptor) = self.interceptor.read().await.as_ref() {
                 match interceptor.intercept(&request_info).await {
                     InterceptAction::Continue => {}
                     InterceptAction::Block => {
-                        return Err(ObscuraNetError::Blocked(current_url.to_string()));
+                        return Err(ObscuraNetError::Blocked("by request policy".into()));
                     }
                     InterceptAction::Fulfill(response) => {
                         return Ok(response);
                     }
-                    InterceptAction::ModifyHeaders(headers) => {
-                        let mut extra = self.extra_headers.write().await;
-                        extra.extend(headers);
+                    InterceptAction::ModifyHeaders(headers) => hop_headers.extend(headers),
+                    InterceptAction::ModifyRequest { url, method: new_method, headers, body: new_body } => {
+                        if let Some(url) = url { current_url = url; }
+                        if let Some(new_method) = new_method {
+                            method = Method::from_bytes(new_method.as_bytes())
+                                .map_err(|_| ObscuraNetError::Network("Invalid request method".into()))?;
+                        }
+                        if let Some(new_body) = new_body { body = Some(new_body); }
+                        hop_headers.extend(headers);
+                        validate_url(&current_url, self.allow_private_network)?;
+                        validate_request_mode(&request, &current_url)?;
+                        request_info.url = current_url.clone();
+                        request_info.method = method.to_string();
+                    }
+                }
+            }
+
+            // A browser context shares its client across pages. Never install a
+            // CDP page rule in `self.interceptor`: it would affect siblings.
+            if let Some(interceptor) = options.interceptor {
+                match interceptor.intercept(&request_info).await {
+                    InterceptAction::Continue => {}
+                    InterceptAction::Block => {
+                        return Err(ObscuraNetError::Blocked("by request policy".into()));
+                    }
+                    InterceptAction::Fulfill(response) => return Ok(response),
+                    InterceptAction::ModifyHeaders(headers) => hop_headers.extend(headers),
+                    InterceptAction::ModifyRequest { url, method: new_method, headers, body: new_body } => {
+                        if let Some(url) = url { current_url = url; }
+                        if let Some(new_method) = new_method {
+                            method = Method::from_bytes(new_method.as_bytes())
+                                .map_err(|_| ObscuraNetError::Network("Invalid request method".into()))?;
+                        }
+                        if let Some(new_body) = new_body { body = Some(new_body); }
+                        hop_headers.extend(headers);
+                        validate_url(&current_url, self.allow_private_network)?;
+                        validate_request_mode(&request, &current_url)?;
                     }
                 }
             }
@@ -1545,7 +1658,10 @@ impl ObscuraHttpClient {
                 request_callback_fired = true;
             }
 
-            let ua = self.user_agent.read().await.clone();
+            let ua = match options.user_agent {
+                Some(value) => value.to_string(),
+                None => self.user_agent.read().await.clone(),
+            };
             let (sec_ch_ua, sec_ch_ua_platform) = chrome_client_hints(&ua);
             let mut headers = HeaderMap::new();
             // Chrome's top-level navigation header order. (reqwest appends
@@ -1593,7 +1709,10 @@ impl ObscuraHttpClient {
                 }
             }
             let request_origin = serialized_request_origin(&request, redirect_tainted);
-            let accept_language = self.accept_language.read().await.clone();
+            let accept_language = match options.accept_language {
+                Some(value) => value.to_string(),
+                None => self.accept_language.read().await.clone(),
+            };
             if let Ok(value) = HeaderValue::from_str(&accept_language) {
                 if !accept_language.is_empty() {
                     headers.insert(reqwest::header::ACCEPT_LANGUAGE, value);
@@ -1648,6 +1767,13 @@ impl ObscuraHttpClient {
                     HeaderValue::from_str(v),
                 ) {
                     headers.insert(name, val);
+                }
+            }
+            for (k, v) in hop_headers {
+                if let (Ok(name), Ok(value)) = (
+                    HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_str(&v),
+                ) {
+                    headers.insert(name, value);
                 }
             }
             // Origin is a forbidden browser request header. Keep it derived
@@ -1803,11 +1929,13 @@ pub enum ObscuraNetError {
 mod ssrf_tests {
     use super::{
         is_forbidden_ip, merge_response_header, request_fetch_site, request_referrer, validate_url,
-        CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCredentials, RequestMode,
-        ResourceRequest, ResourceType, SsrfGuardResolver,
+        CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCredentials, RequestInfo,
+        RequestMode, RequestOptions, ResourceRequest, ResourceType, SsrfGuardResolver,
     };
     use crate::cookies::CookieJar;
+    use crate::interceptor::{InterceptAction, RequestInterceptor};
     use reqwest::dns::{Name, Resolve};
+    use reqwest::Method;
     use std::collections::HashMap;
     use std::net::IpAddr;
     use std::str::FromStr;
@@ -2551,6 +2679,43 @@ mod ssrf_tests {
             .unwrap();
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         assert_eq!(responses.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn scoped_interceptor_blocks_redirect_before_network_io() {
+        struct BlockFinal;
+
+        #[async_trait::async_trait]
+        impl RequestInterceptor for BlockFinal {
+            async fn intercept(&self, request: &RequestInfo) -> InterceptAction {
+                if request.url.path() == "/final" {
+                    InterceptAction::Block
+                } else {
+                    InterceptAction::Continue
+                }
+            }
+        }
+
+        let redirect = "HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let (target, mut requests) =
+            http_fixture(vec![redirect.to_string(), ok_response("", "should not load")]).await;
+        let client = ObscuraHttpClient::with_full_options(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+        );
+        let result = client
+            .fetch_with_method_options(
+                Method::GET,
+                &target,
+                None,
+                None,
+                RequestOptions { interceptor: Some(&BlockFinal), ..Default::default() },
+            )
+            .await;
+        assert!(matches!(result, Err(ObscuraNetError::Blocked(_))));
+        assert!(requests.recv().await.unwrap().starts_with("GET /resource "));
+        assert!(requests.try_recv().is_err(), "redirect target received a request");
     }
 
     async fn cacheable_resource_fixture(

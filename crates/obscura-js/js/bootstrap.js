@@ -20,6 +20,7 @@ const __obscuraCore = globalThis.Deno.core;
     // runtime-set by Rust (runtime.rs / page.rs)
     '__obscura_errors', '__obscura_init', '__obscura_hide_list',
     '__obscura_objects', '__obscura_oid', '__obscura_ua',
+    '__obscura_language', '__obscura_locale',
     '__obscura_platform', '__obscura_ua_platform', '__obscura_ua_platform_version',
     '__obscura_stealth', '__obscura_markTrusted', '__obscura_core_handoff',
     '__obscura_frameId', '__obscura_parentFrameId', '__obscura_frameWindows',
@@ -72,6 +73,30 @@ const __obscuraCore = globalThis.Deno.core;
   var _desc = { value: undefined, writable: true, enumerable: false, configurable: true };
   for (var _i = 0; _i < _names.length; _i++) {
     try { Object.defineProperty(globalThis, _names[_i], _desc); } catch (_e) {}
+  }
+})();
+
+// ICU's default locale is process-wide. Supply the page's locale only when an
+// Intl constructor is called without an explicit one, so simultaneous pages
+// can use different defaults without changing the V8 process setting.
+(function _installPageIntlLocale() {
+  for (const name of ['DateTimeFormat', 'NumberFormat', 'Collator', 'PluralRules',
+                      'RelativeTimeFormat', 'ListFormat', 'DisplayNames', 'Segmenter']) {
+    const Native = Intl[name];
+    if (typeof Native !== 'function') continue;
+    const withLocale = (args) => {
+      if (args.length && args[0] !== undefined) return args;
+      const locale = globalThis.__obscura_locale || 'en-US';
+      return [locale, ...args.slice(1)];
+    };
+    Intl[name] = new Proxy(Native, {
+      apply(target, thisArg, args) {
+        return Reflect.apply(target, thisArg, withLocale(args));
+      },
+      construct(target, args, newTarget) {
+        return Reflect.construct(target, withLocale(args), newTarget);
+      },
+    });
   }
 })();
 
@@ -7215,8 +7240,12 @@ globalThis.navigator = {
   defGetter('platform', function() {
     return globalThis.__obscura_platform || "Win32";
   });
-  defGetter('language', function() { return "en-US"; });
-  defGetter('languages', function() { return ["en-US", "en"]; });
+  defGetter('language', function() { return globalThis.__obscura_language || "en-US"; });
+  defGetter('languages', function() {
+    const language = globalThis.__obscura_language || "en-US";
+    const base = language.split('-')[0];
+    return base === language ? [language] : [language, base];
+  });
 
   // Cache plugins/mimeTypes so navigator.plugins === navigator.plugins.
   var _plugins = new PluginArray([

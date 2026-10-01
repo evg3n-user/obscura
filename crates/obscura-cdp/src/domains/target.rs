@@ -246,6 +246,12 @@ pub async fn handle(
                 ctx.sessions.remove(session_id);
                 ctx.runtime_enabled_sessions.remove(session_id);
                 if let Some(page_id) = page_id {
+                    if ctx.fetch_intercept.sessions_by_page.get(&page_id).is_some_and(|owner| owner == session_id) {
+                        ctx.fetch_intercept.sessions_by_page.remove(&page_id);
+                        if let Some(page) = ctx.get_page_mut(&page_id) {
+                            page.enable_intercept(false);
+                        }
+                    }
                     ctx.refresh_runtime_event_collection(&page_id);
                 }
                 #[cfg(feature = "render")]

@@ -65,6 +65,24 @@ pub async fn handle(
     session_id: &Option<String>,
 ) -> Result<Value, String> {
     match method {
+        "setUserAgentOverride" => {
+            let user_agent = params.get("userAgent").and_then(Value::as_str)
+                .ok_or("Emulation.setUserAgentOverride requires userAgent")?;
+            let accept_language = params.get("acceptLanguage").and_then(Value::as_str);
+            let page = ctx.get_session_page_mut(session_id).ok_or("No page for session")?;
+            page.set_user_agent_override(Some(user_agent.to_string()));
+            if let Some(value) = accept_language {
+                page.set_accept_language_override(Some(value.to_string()));
+            }
+            Ok(json!({}))
+        }
+        "setLocaleOverride" => {
+            let locale = params.get("locale").and_then(Value::as_str)
+                .ok_or("Emulation.setLocaleOverride requires locale")?;
+            let page = ctx.get_session_page_mut(session_id).ok_or("No page for session")?;
+            page.set_locale_override(Some(locale.to_string()));
+            Ok(json!({}))
+        }
         "setDeviceMetricsOverride" => {
             let width = metric_dimension(params, "width")?;
             let height = metric_dimension(params, "height")?;
@@ -131,6 +149,31 @@ pub async fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn locale_overrides_update_navigator_and_intl_for_one_page() {
+        let mut ctx = CdpContext::new();
+        let polish_id = ctx.create_page();
+        let english_id = ctx.create_page();
+        let polish_session = Some("polish-session".to_string());
+        let english_session = Some("english-session".to_string());
+        ctx.sessions.insert(polish_session.clone().unwrap(), polish_id);
+        ctx.sessions.insert(english_session.clone().unwrap(), english_id);
+
+        for (session, locale) in [(&polish_session, "pl-PL"), (&english_session, "en-GB")] {
+            handle("setUserAgentOverride", &json!({"userAgent": "", "acceptLanguage": locale}), &mut ctx, session)
+                .await.unwrap();
+            handle("setLocaleOverride", &json!({"locale": locale}), &mut ctx, session)
+                .await.unwrap();
+        }
+
+        let polish = ctx.get_session_page_mut(&polish_session).unwrap();
+        assert_eq!(polish.evaluate("return [navigator.language, Intl.DateTimeFormat().resolvedOptions().locale];"),
+                   json!(["pl-PL", "pl-PL"]));
+        let english = ctx.get_session_page_mut(&english_session).unwrap();
+        assert_eq!(english.evaluate("return [navigator.language, Intl.DateTimeFormat().resolvedOptions().locale];"),
+                   json!(["en-GB", "en-GB"]));
+    }
 
     #[tokio::test]
     async fn device_metrics_override_updates_page_and_window_viewport() {

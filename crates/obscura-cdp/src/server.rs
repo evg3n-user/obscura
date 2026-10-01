@@ -1184,8 +1184,18 @@ async fn cdp_processor(
                         std::future::pending().await
                     }
                 }, if has_intercept_rx => {
+                    let routed_page = intercepted.page_id.as_ref().and_then(|page_id| {
+                        ctx.fetch_intercept.sessions_by_page.get(page_id).and_then(|session_id| {
+                            ctx.get_page(page_id).map(|page| (session_id.clone(), page.frame_id.clone()))
+                        })
+                    });
+                    let route = if intercepted.page_id.is_some() {
+                        routed_page.as_ref()
+                    } else {
+                        live_page_route.as_ref()
+                    };
                     if let (Some((session_id, frame_id)), Some(reply_tx)) =
-                        (live_page_route.as_ref(), connection_reply_tx.as_ref())
+                        (route, connection_reply_tx.as_ref())
                     {
                         emit_intercepted_request(
                             intercepted,
@@ -1281,9 +1291,8 @@ fn emit_intercepted_request(
     >,
 ) {
     tracing::info!(
-        "INTERCEPTION: requestPaused for {} {} (sending to client)",
+        "INTERCEPTION: requestPaused for {} (sending to client)",
         intercepted.method,
-        intercepted.url
     );
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1311,7 +1320,12 @@ fn emit_intercepted_request(
         },
         "sessionId": session_id,
     });
-    let _ = reply_tx.send(request_will_be_sent.to_string());
+    // Native document navigation emits its canonical Network events after the
+    // response is committed. Emitting another request id here makes Playwright
+    // wait for a main-document request that can never receive loadingFinished.
+    if intercepted.resource_type != "Document" {
+        let _ = reply_tx.send(request_will_be_sent.to_string());
+    }
 
     let request_paused = json!({
         "method": "Fetch.requestPaused",
@@ -1618,6 +1632,10 @@ async fn process_with_interception(
     }
 
     let session_for_events = req.session_id.clone();
+    let fetch_session_for_events = ctx.fetch_intercept.sessions_by_page
+        .get(&page_id)
+        .cloned()
+        .or_else(|| req.session_id.clone());
     let frame_id = page.frame_id.clone();
     let loader_id = format!("loader-{}", uuid::Uuid::new_v4());
 
@@ -1688,7 +1706,7 @@ async fn process_with_interception(
                 emit_intercepted_request(
                     intercepted,
                     &frame_id,
-                    session_for_events.clone(),
+                    fetch_session_for_events.clone(),
                     reply_tx,
                     intercepted_paused,
                 );

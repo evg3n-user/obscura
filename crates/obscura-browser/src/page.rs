@@ -6,12 +6,14 @@ use obscura_js::frame::FrameRealm;
 use obscura_js::runtime::ObscuraJsRuntime;
 use obscura_net::{
     CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCallback, ResourceRequest,
-    ResourceType, Response, ResponseCallback,
+    RequestOptions, ResourceType, Response, ResponseCallback,
 };
+use obscura_net::interceptor::RequestInterceptor;
 use url::Url;
 
 use crate::context::BrowserContext;
 use crate::lifecycle::LifecycleState;
+use crate::request_interception::{url_matches_cdp_pattern, PageRequestInterceptor};
 
 /// Parse `OBSCURA_GEOLOCATION="lat,lon"` for the navigator.geolocation shim.
 /// Returns None when unset or malformed, leaving the built-in default in place.
@@ -282,6 +284,9 @@ pub struct Page {
     pub intercept_block_patterns: Vec<String>,
     pub blocked_url_patterns: Vec<String>,
     intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>>,
+    accept_language_override: Option<String>,
+    user_agent_override: Option<String>,
+    locale_override: Option<String>,
     // Scripts to execute in the page's JS context BEFORE any of the page's
     // own scripts run — the CDP `Page.addScriptToEvaluateOnNewDocument`
     // contract. Includes `Runtime.addBinding` shims so puppeteer's
@@ -1098,6 +1103,9 @@ impl Page {
             intercept_block_patterns: Vec::new(),
             blocked_url_patterns: Vec::new(),
             intercept_tx: None,
+            accept_language_override: None,
+            user_agent_override: None,
+            locale_override: None,
             preload_scripts: Vec::new(),
             runtime_events_enabled: std::cell::Cell::new(false),
             console_messages_enabled: std::cell::Cell::new(false),
@@ -1139,13 +1147,6 @@ impl Page {
         for pattern in &self.blocked_url_patterns {
             if url_matches_cdp_pattern(pattern, url) {
                 return true;
-            }
-        }
-        if self.intercept_enabled {
-            for pattern in &self.intercept_block_patterns {
-                if url_matches_cdp_pattern(pattern, url) {
-                    return true;
-                }
             }
         }
         false
@@ -1687,15 +1688,65 @@ impl Page {
         self.default_background_color_override = color;
     }
 
+    pub fn set_user_agent_override(&mut self, user_agent: Option<String>) {
+        self.user_agent_override = user_agent.filter(|value| !value.is_empty());
+        if let Some(js) = &mut self.js {
+            js.set_user_agent(self.user_agent_override.as_deref().unwrap_or(&self.context.user_agent));
+            js.set_request_headers(self.accept_language_override.clone(), self.user_agent_override.clone());
+        }
+    }
+
+    pub fn set_accept_language_override(&mut self, accept_language: Option<String>) {
+        self.accept_language_override = accept_language.filter(|value| !value.is_empty());
+        let language = self.accept_language_override.as_deref()
+            .and_then(|value| value.split(',').next())
+            .unwrap_or("en-US")
+            .trim();
+        if let Some(js) = &mut self.js {
+            js.set_language(language);
+            js.set_request_headers(self.accept_language_override.clone(), self.user_agent_override.clone());
+        }
+    }
+
+    pub fn set_locale_override(&mut self, locale: Option<String>) {
+        self.locale_override = locale.filter(|value| !value.is_empty());
+        if let Some(js) = &mut self.js {
+            js.set_locale(self.locale_override.as_deref().unwrap_or("en-US"));
+        }
+    }
+
     #[cfg(feature = "render")]
     fn capture_surface_color(&self) -> [u8; 4] {
         self.default_background_color_override
             .unwrap_or([255, 255, 255, 255])
     }
 
+    fn request_interceptor(&self) -> Option<PageRequestInterceptor> {
+        if !self.intercept_enabled {
+            return None;
+        }
+        self.intercept_tx.as_ref().map(|tx| PageRequestInterceptor {
+            page_id: self.id.clone(),
+            patterns: self.intercept_block_patterns.clone(),
+            tx: tx.clone(),
+        })
+    }
+
+    fn shared_request_interceptor(&self) -> Option<Arc<dyn RequestInterceptor + Send + Sync>> {
+        self.request_interceptor()
+            .map(|interceptor| Arc::new(interceptor) as Arc<dyn RequestInterceptor + Send + Sync>)
+    }
+
     async fn do_fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
+        let interceptor = self.request_interceptor();
+        if self.intercept_enabled && interceptor.is_none() {
+            return Err(ObscuraNetError::Blocked("interception channel unavailable".into()));
+        }
         #[cfg(feature = "stealth")]
         if let Some(ref stealth) = self.stealth_client {
+            if interceptor.is_some() {
+                return Err(ObscuraNetError::Blocked("stealth interception unavailable".into()));
+            }
             // Pass the page callbacks so CDP Network events and
             // page.on('request'/'response') observers fire for stealth-mode
             // navigations too, matching the non-stealth path below.
@@ -1704,7 +1755,15 @@ impl Page {
                 .await;
         }
         self.http_client
-            .fetch_with_callbacks(url, Some(&self.callbacks))
+            .fetch_with_callbacks_options(
+                url,
+                Some(&self.callbacks),
+                RequestOptions {
+                    interceptor: interceptor.as_ref().map(|value| value as _),
+                    accept_language: self.accept_language_override.as_deref(),
+                    user_agent: self.user_agent_override.as_deref(),
+                },
+            )
             .await
     }
     fn init_js(&mut self) {
@@ -1737,6 +1796,7 @@ impl Page {
             &self.url_string(),
             self.context.proxy_url.clone(),
         );
+        rt.set_page_id(&self.id);
         rt.set_url(&self.url_string());
         rt.set_encoding(&self.encoding);
         rt.set_title(&self.title);
@@ -1772,6 +1832,14 @@ impl Page {
                 &self.context.ua_platform_version,
             );
         }
+        if let Some(user_agent) = &self.user_agent_override {
+            rt.set_user_agent(user_agent);
+        }
+        rt.set_language(self.accept_language_override.as_deref()
+            .and_then(|value| value.split(',').next())
+            .unwrap_or("en-US")
+            .trim());
+        rt.set_locale(self.locale_override.as_deref().unwrap_or("en-US"));
         if let Some((lat, lon)) = env_geolocation() {
             rt.set_geolocation(lat, lon);
         }
@@ -1785,6 +1853,8 @@ impl Page {
         rt.set_cookie_jar(self.context.cookie_jar.clone());
         rt.set_http_client(self.http_client.clone());
         rt.set_callbacks(self.callbacks.clone());
+        rt.set_request_headers(self.accept_language_override.clone(), self.user_agent_override.clone());
+        rt.set_request_interceptor(self.shared_request_interceptor());
         rt.set_blocked_urls(self.blocked_url_patterns.clone());
         #[cfg(feature = "stealth")]
         if let Some(ref stealth) = self.stealth_client {
@@ -1918,6 +1988,10 @@ impl Page {
         while !pending.is_empty() {
             let batch = std::mem::take(&mut pending);
             let client = self.http_client.clone();
+            let interceptor = self.shared_request_interceptor();
+            let intercept_unavailable = self.intercept_enabled && interceptor.is_none();
+            let accept_language = self.accept_language_override.clone();
+            let user_agent = self.user_agent_override.clone();
             #[cfg(feature = "stealth")]
             let stealth_client = self.stealth_client.clone();
             let callbacks = self.callbacks.clone();
@@ -1926,6 +2000,9 @@ impl Page {
             let results: Vec<_> =
                 futures::stream::iter(batch.into_iter().map(|(key, requested_url, depth)| {
                     let client = client.clone();
+                    let interceptor = interceptor.clone();
+                    let accept_language = accept_language.clone();
+                    let user_agent = user_agent.clone();
                     #[cfg(feature = "stealth")]
                     let stealth_client = stealth_client.clone();
                     let callbacks = callbacks.clone();
@@ -1933,30 +2010,48 @@ impl Page {
                     async move {
                         let request =
                             ResourceRequest::subresource(ResourceType::Stylesheet, &initiator);
+                        if intercept_unavailable {
+                            return (key, requested_url, depth,
+                                Err(ObscuraNetError::Blocked("interception channel unavailable".into())));
+                        }
                         #[cfg(feature = "stealth")]
                         let result = if let Some(stealth_client) = stealth_client {
-                            stealth_client
+                            if interceptor.is_some() {
+                                Err(ObscuraNetError::Blocked("stealth interception unavailable".into()))
+                            } else {
+                                stealth_client
                                 .fetch_resource_with_callbacks(
                                     &requested_url,
                                     request,
                                     Some(&callbacks),
                                 )
                                 .await
+                            }
                         } else {
                             client
-                                .fetch_resource_with_callbacks(
+                                .fetch_resource_with_callbacks_options(
                                     &requested_url,
                                     request,
                                     Some(&callbacks),
+                                    RequestOptions {
+                                        interceptor: interceptor.as_deref(),
+                                        accept_language: accept_language.as_deref(),
+                                        user_agent: user_agent.as_deref(),
+                                    },
                                 )
                                 .await
                         };
                         #[cfg(not(feature = "stealth"))]
                         let result = client
-                            .fetch_resource_with_callbacks(
+                            .fetch_resource_with_callbacks_options(
                                 &requested_url,
                                 request,
                                 Some(&callbacks),
+                                RequestOptions {
+                                    interceptor: interceptor.as_deref(),
+                                    accept_language: accept_language.as_deref(),
+                                    user_agent: user_agent.as_deref(),
+                                },
                             )
                             .await;
                         (key, requested_url, depth, result)
@@ -2349,6 +2444,10 @@ impl Page {
 
         let client = self.http_client.clone();
         let page_callbacks = self.callbacks.clone();
+        let interceptor = self.shared_request_interceptor();
+        let intercept_unavailable = self.intercept_enabled && interceptor.is_none();
+        let accept_language = self.accept_language_override.clone();
+        let user_agent = self.user_agent_override.clone();
         let script_initiator = self
             .url
             .clone()
@@ -2357,6 +2456,9 @@ impl Page {
             .iter()
             .map(|(idx, url)| {
                 let client = client.clone();
+                let interceptor = interceptor.clone();
+                let accept_language = accept_language.clone();
+                let user_agent = user_agent.clone();
                 let cbs = page_callbacks.clone();
                 let initiator = script_initiator.clone();
                 let url = url.clone();
@@ -2389,8 +2491,18 @@ impl Page {
                         return Some((idx, url, resp));
                     }
                     let request = ResourceRequest::subresource(ResourceType::Script, &initiator);
+                    if intercept_unavailable {
+                        return None;
+                    }
                     match client
-                        .fetch_resource_with_callbacks(&parsed, request, Some(&cbs))
+                        .fetch_resource_with_callbacks_options(
+                            &parsed, request, Some(&cbs),
+                            RequestOptions {
+                                interceptor: interceptor.as_deref(),
+                                accept_language: accept_language.as_deref(),
+                                user_agent: user_agent.as_deref(),
+                            },
+                        )
                         .await
                     {
                         Ok(resp) => Some((idx, url, resp)),
@@ -3269,11 +3381,7 @@ impl Page {
                     robots_url.set_path("/robots.txt");
                     robots_url.set_query(None);
                     robots_url.set_fragment(None);
-                    let body = match self
-                        .http_client
-                        .fetch_with_callbacks(&robots_url, Some(&self.callbacks))
-                        .await
-                    {
+                    let body = match self.do_fetch(&robots_url).await {
                         Ok(resp) if resp.status == 200 => {
                             String::from_utf8_lossy(&resp.body).into_owned()
                         }
@@ -3334,8 +3442,21 @@ impl Page {
                 redirected_from: Vec::new(),
             })
         } else if method == "POST" {
+            let interceptor = self.request_interceptor();
+            if self.intercept_enabled && interceptor.is_none() {
+                return Err(PageError::NetworkError("interception channel unavailable".into()));
+            }
             self.http_client
-                .post_form_with_callbacks(&url, body, Some(&self.callbacks))
+                .post_form_with_callbacks_options(
+                    &url,
+                    body,
+                    Some(&self.callbacks),
+                    RequestOptions {
+                        interceptor: interceptor.as_ref().map(|value| value as _),
+                        accept_language: self.accept_language_override.as_deref(),
+                        user_agent: self.user_agent_override.as_deref(),
+                    },
+                )
                 .await
         } else {
             self.do_fetch(&url).await
@@ -4707,15 +4828,19 @@ impl Page {
         tx: tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>,
     ) {
         self.intercept_tx = Some(tx.clone());
+        let interceptor = self.shared_request_interceptor();
         if let Some(js) = &self.js {
             js.set_intercept_tx(tx);
+            js.set_request_interceptor(interceptor);
         }
     }
 
     pub fn enable_intercept(&mut self, enabled: bool) {
         self.intercept_enabled = enabled;
+        let interceptor = self.shared_request_interceptor();
         if let Some(js) = &self.js {
             js.set_intercept_enabled(enabled);
+            js.set_request_interceptor(interceptor);
             // `Fetch.enable` assigns the patterns right before this call;
             // the renderer's loads follow the same interception policy.
             #[cfg(feature = "render")]
@@ -4726,33 +4851,6 @@ impl Page {
 
 fn script_response_is_executable(status: u16) -> bool {
     (200..=299).contains(&status)
-}
-
-fn url_matches_cdp_pattern(pattern: &str, url: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-
-    let mut remainder = url;
-    let mut first = true;
-    for part in pattern.split('*') {
-        if part.is_empty() {
-            continue;
-        }
-
-        let Some(index) = remainder.find(part) else {
-            return false;
-        };
-
-        if first && !pattern.starts_with('*') && index != 0 {
-            return false;
-        }
-
-        remainder = &remainder[index + part.len()..];
-        first = false;
-    }
-
-    pattern.ends_with('*') || remainder.is_empty()
 }
 
 impl Drop for Page {
@@ -4777,6 +4875,18 @@ mod tests {
     use super::remaining_settle_resource_warmup_ms;
     use base64::Engine as _;
     use obscura_dom::parse_html;
+
+    fn install_rejecting_interceptor(page: &mut super::Page) -> tokio::task::JoinHandle<()> {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<obscura_js::ops::InterceptedRequest>();
+        page.set_intercept_tx(tx);
+        tokio::spawn(async move {
+            while let Some(request) = rx.recv().await {
+                let _ = request.resolver.send(obscura_js::ops::InterceptResolution::Fail {
+                    reason: "BlockedByClient".into(),
+                });
+            }
+        })
+    }
 
     fn install_linked_stylesheet(
         runtime: &mut obscura_js::runtime::ObscuraJsRuntime,
@@ -5314,6 +5424,7 @@ mod tests {
         let mut page = super::Page::new("stylesheet-graph".to_string(), context);
         page.set_blocked_urls(vec!["*blocked.css".to_string()]);
         page.intercept_block_patterns = vec!["*intercepted.css".to_string()];
+        let _route_responder = install_rejecting_interceptor(&mut page);
         page.enable_intercept(true);
 
         let request_count = std::sync::Arc::new(AtomicUsize::new(0));
@@ -8282,9 +8393,8 @@ mod tests {
         );
     }
 
-    /// Renderer misses follow the page's `Fetch.enable` interception policy
-    /// like the warmup scan: an intercepted URL is not fetched behind the
-    /// client's back, other URLs still load.
+    /// Renderer misses pause matching requests for a CDP client decision;
+    /// a rejected URL is not fetched behind the client's back.
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
     async fn renderer_misses_honour_fetch_interception_patterns() {
@@ -8301,8 +8411,9 @@ mod tests {
                 <p id="a" style="font-family:A">a</p><p id="b" style="font-family:B">b</p>"#
             ),
         );
-        // What `Fetch.enable` does: patterns first, then enable.
+        // A matching request is rejected by the simulated CDP client.
         page.intercept_block_patterns = vec!["*intercepted.ttf".to_string()];
+        let _route_responder = install_rejecting_interceptor(&mut page);
         page.enable_intercept(true);
         page.js
             .as_mut()

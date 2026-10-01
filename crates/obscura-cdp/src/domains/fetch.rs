@@ -33,6 +33,7 @@ pub enum FetchResolution {
 pub struct FetchInterceptState {
     pub enabled: bool,
     pub patterns: Vec<String>,
+    pub sessions_by_page: HashMap<String, String>,
     pub paused: HashMap<String, PausedRequest>,
     request_counter: u64,
 }
@@ -42,6 +43,7 @@ impl FetchInterceptState {
         FetchInterceptState {
             enabled: false,
             patterns: Vec::new(),
+            sessions_by_page: HashMap::new(),
             paused: HashMap::new(),
             request_counter: 0,
         }
@@ -77,6 +79,9 @@ pub async fn handle(
 
             ctx.fetch_intercept.enabled = true;
             ctx.fetch_intercept.patterns = patterns.clone();
+            if let (Some(page), Some(session)) = (ctx.get_session_page(session_id), session_id.as_ref()) {
+                ctx.fetch_intercept.sessions_by_page.insert(page.id.clone(), session.clone());
+            }
             let tx_clone = ctx.intercept_tx.clone();
             if let Some(page) = ctx.get_session_page_mut(session_id) {
                 page.intercept_block_patterns = patterns.clone();
@@ -92,6 +97,9 @@ pub async fn handle(
         "disable" => {
             ctx.fetch_intercept.enabled = false;
             ctx.fetch_intercept.patterns.clear();
+            if let Some(page) = ctx.get_session_page(session_id) {
+                ctx.fetch_intercept.sessions_by_page.remove(&page.id.clone());
+            }
             if let Some(page) = ctx.get_session_page_mut(session_id) {
                 page.intercept_block_patterns.clear();
                 page.enable_intercept(false);

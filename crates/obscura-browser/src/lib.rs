@@ -2,6 +2,7 @@ pub mod context;
 mod fork_virtual_url;
 pub mod lifecycle;
 pub mod page;
+mod request_interception;
 #[cfg(feature = "render")]
 pub mod pdf;
 pub mod profiles;

@@ -9,7 +9,7 @@ use std::task::{Context, Poll};
 use deno_core::{JsRuntime, RuntimeOptions, v8};
 use obscura_dom::{DomTree, NodeId};
 #[cfg(feature = "render")]
-use obscura_net::{RequestCredentials, RequestMode, ResourceRequest};
+use obscura_net::{RequestCredentials, RequestMode, RequestOptions, ResourceRequest};
 
 /// Re-exported so other crates (obscura-browser, obscura-cdp) can name the V8
 /// isolate handle without taking a direct dependency on deno_core.
@@ -885,7 +885,7 @@ impl ObscuraJsRuntime {
     ) {
         use deno_core::v8;
 
-        const IDENTITY_GLOBALS: [&str; 7] = [
+        const IDENTITY_GLOBALS: [&str; 9] = [
             "__obscura_ua",
             "__obscura_platform",
             "__obscura_ua_platform",
@@ -893,6 +893,8 @@ impl ObscuraJsRuntime {
             "__obscura_stealth",
             "__obscura_geo_lat",
             "__obscura_geo_lon",
+            "__obscura_language",
+            "__obscura_locale",
         ];
 
         let main = self.runtime().main_context();
@@ -1403,6 +1405,23 @@ impl ObscuraJsRuntime {
         state.intercept_tx = Some(tx);
     }
 
+    pub fn set_page_id(&self, page_id: &str) {
+        self.state.borrow_mut().page_id = Some(page_id.to_string());
+    }
+
+    pub fn set_request_interceptor(
+        &self,
+        interceptor: Option<std::sync::Arc<dyn obscura_net::interceptor::RequestInterceptor + Send + Sync>>,
+    ) {
+        self.state.borrow_mut().request_interceptor = interceptor;
+    }
+
+    pub fn set_request_headers(&self, accept_language: Option<String>, user_agent: Option<String>) {
+        let mut state = self.state.borrow_mut();
+        state.accept_language_override = accept_language;
+        state.user_agent_override = user_agent;
+    }
+
     pub fn set_intercept_enabled(&self, enabled: bool) {
         let mut state = self.state.borrow_mut();
         state.intercept_enabled = enabled;
@@ -1419,6 +1438,20 @@ impl ObscuraJsRuntime {
         let _ = self.execute_runtime_script(
             "<set-ua>",
             format!("globalThis.__obscura_ua = {};", js_string_literal(ua)),
+        );
+    }
+
+    pub fn set_language(&mut self, language: &str) {
+        let _ = self.execute_runtime_script(
+            "<set-language>",
+            format!("globalThis.__obscura_language = {};", js_string_literal(language)),
+        );
+    }
+
+    pub fn set_locale(&mut self, locale: &str) {
+        let _ = self.execute_runtime_script(
+            "<set-locale>",
+            format!("globalThis.__obscura_locale = {};", js_string_literal(locale)),
         );
     }
 
@@ -1981,11 +2014,7 @@ impl ObscuraJsRuntime {
                 .blocked_urls
                 .iter()
                 .any(|pattern| crate::ops::glob_match(pattern, &url))
-                || (state.intercept_enabled
-                    && state
-                        .intercept_block_patterns
-                        .iter()
-                        .any(|pattern| crate::ops::glob_match(pattern, &url)));
+                || (state.intercept_enabled && state.request_interceptor.is_none());
             let allowed = page_render_resource_url_allowed(&state.url, &url);
             if blocked || !allowed {
                 match profile {
@@ -2089,6 +2118,10 @@ impl ObscuraJsRuntime {
         // The page transport is the plain client or, when installed, the
         // stealth client; either one on its own is enough (`has_page_transport`).
         let http_client = state.http_client.clone();
+        let request_interceptor = state.request_interceptor.clone();
+        let accept_language = state.accept_language_override.clone();
+        let user_agent = state.user_agent_override.clone();
+        let intercept_enabled = state.intercept_enabled;
         #[cfg(feature = "stealth")]
         let stealth_client = state.stealth_client.clone();
         let initiator = url::Url::parse(&state.url).ok();
@@ -2112,6 +2145,9 @@ impl ObscuraJsRuntime {
             let loads = deno_core::futures::stream::iter(requests.into_iter().map(
                 |(raw, profile, is_font)| {
                 let http_client = http_client.clone();
+                let request_interceptor = request_interceptor.clone();
+                let accept_language = accept_language.clone();
+                let user_agent = user_agent.clone();
                 #[cfg(feature = "stealth")]
                 let stealth_client = stealth_client.clone();
                 let callbacks = callbacks.clone();
@@ -2134,6 +2170,11 @@ impl ObscuraJsRuntime {
                                 };
                         }
                     };
+                    if intercept_enabled && request_interceptor.is_none() {
+                        return crate::ops::RenderResourceLoad {
+                            generation, url: raw, profile, is_font, response: None,
+                        };
+                    }
                     let kind = if is_font {
                         obscura_net::ResourceType::Font
                     } else {
@@ -2153,6 +2194,7 @@ impl ObscuraJsRuntime {
                     }
                     #[cfg(feature = "stealth")]
                     let response = match (stealth_client, http_client) {
+                        (Some(_), _) if request_interceptor.is_some() => None,
                         (Some(stealth_client), _) => stealth_client
                                 .fetch_resource_with_callbacks(
                                     &parsed,
@@ -2162,10 +2204,15 @@ impl ObscuraJsRuntime {
                             .await
                             .ok(),
                         (None, Some(http_client)) => http_client
-                                .fetch_resource_with_callbacks(
+                                .fetch_resource_with_callbacks_options(
                                     &parsed,
                                     request,
                                     callbacks.as_deref(),
+                                    RequestOptions {
+                                        interceptor: request_interceptor.as_deref(),
+                                        accept_language: accept_language.as_deref(),
+                                        user_agent: user_agent.as_deref(),
+                                    },
                                 )
                             .await
                             .ok(),
@@ -2174,10 +2221,15 @@ impl ObscuraJsRuntime {
                     #[cfg(not(feature = "stealth"))]
                     let response = match http_client {
                         Some(http_client) => http_client
-                                .fetch_resource_with_callbacks(
+                                .fetch_resource_with_callbacks_options(
                                     &parsed,
                                     request,
                                     callbacks.as_deref(),
+                                    RequestOptions {
+                                        interceptor: request_interceptor.as_deref(),
+                                        accept_language: accept_language.as_deref(),
+                                        user_agent: user_agent.as_deref(),
+                                    },
                                 )
                             .await
                             .ok(),
